@@ -2,8 +2,8 @@ FROM python:3.9.6-alpine3.14
 
 COPY . /build
 
-RUN apk add --no-cache --virtual .build-deps gcc musl-dev libffi-dev \
-     && pip install cython && cd /build && pip install . && rm -rf /build && apk del .build-deps gcc musl-dev libffi-dev
+RUN apk add --no-cache --virtual .build-deps gcc musl-dev libffi-dev g++ \
+     && pip install cython && cd /build && pip install . && rm -rf /build && apk del .build-deps gcc musl-dev libffi-dev g++
 
 EXPOSE 8089 5557
 
