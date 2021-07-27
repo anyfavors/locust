@@ -4,8 +4,8 @@ COPY . /build
 
 RUN apk update && apk add python3
 
-RUN apk add --no-cache --virtual .build-deps gcc musl-dev libffi-dev g++ make build-base libzmq zeromq-dev py3-pip \
-     && pip install cython && cd /build && pip install . && rm -rf /build && apk del .build-deps gcc musl-dev libffi-dev g++ make build-base libzmq zeromq-dev py3-pip
+RUN apk add --no-cache --virtual .build-deps gcc musl-dev libffi-dev g++ make build-base libzmq zeromq-dev py3-pip python3-dev \
+     && pip install cython && cd /build && pip install . && rm -rf /build && apk del .build-deps gcc musl-dev libffi-dev g++ make build-base libzmq zeromq-dev py3-pip python3-dev
 
 EXPOSE 8089 5557
 
