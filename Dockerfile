@@ -1,4 +1,4 @@
-FROM python:3.8
+FROM python:3.9-slim
 
 COPY . /build
 RUN cd /build && pip install . && rm -rf /build
