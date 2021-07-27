@@ -1,4 +1,8 @@
-FROM python:3.9-slim
+FROM python:3.9.6-alpine3.14
+
+RUN apk add --no-cache --virtual .build-deps gcc musl-dev \
+     && pip install cython \
+     && apk del .build-deps gcc musl-dev
 
 COPY . /build
 RUN cd /build && pip install . && rm -rf /build
