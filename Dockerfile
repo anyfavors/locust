@@ -9,12 +9,11 @@ RUN apk add --no-cache --virtual .build-deps gcc musl-dev libffi-dev g++ make bu
 
 EXPOSE 8089 5557
 
+#make it work on both alpine and ubuntu as the helm charts set this via configmap.
+RUN ln -s /usr/bin/locust /usr/local/bin/locust
 
 RUN adduser -D locust
 USER locust
-
-#make it work on both alpine and ubuntu as the helm charts set this via configmap.
-RUN ln -s /usr/bin/locust /usr/local/bin/locust
 
 WORKDIR /home/locust
 ENTRYPOINT ["locust"]
