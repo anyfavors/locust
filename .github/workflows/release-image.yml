@@ -25,12 +25,12 @@ jobs:
          
       - name: Build an canary security image from Dockerfile #for trivy checks before doing a crossbuild.
         run: |
-          docker build -t docker.io/anyfavors/alpssh:${{ github.sha }} .
+          docker build -t docker.io/anyfavors/locust:${{ github.sha }} .
           
       - name: Run Trivy vulnerability scanner
         uses: aquasecurity/trivy-action@master
         with:
-          image-ref: 'docker.io/anyfavors/alpssh:${{ github.sha }}'
+          image-ref: 'docker.io/anyfavors/locust:${{ github.sha }}'
           format: 'template'
           template: '@/contrib/sarif.tpl'
           output: 'trivy-results.sarif'
