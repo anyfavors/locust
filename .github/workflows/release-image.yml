@@ -80,7 +80,7 @@ jobs:
             type=semver,enable=true,priority=900,pattern={{version}},value=${{ steps.semantic_version.outputs.version }}         
             
             
-         - name: Set up QEMU
+      - name: Set up QEMU
         uses: docker/setup-qemu-action@v1
         with:
           platforms: all
