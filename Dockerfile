@@ -1,9 +1,11 @@
-FROM python:3.9.6-alpine3.14
+FROM alpine:3.14
 
 COPY . /build
 
-RUN apk add --no-cache --virtual .build-deps gcc musl-dev libffi-dev g++ make py3-zmq \
-     && pip install cython && cd /build && pip install . && rm -rf /build && apk del .build-deps gcc musl-dev libffi-dev g++ make py3-zmq
+RUN apk update && apk add python3
+
+RUN apk add --no-cache --virtual .build-deps gcc musl-dev libffi-dev g++ make build-base libzmq zeromq-dev \
+     && pip install cython && cd /build && pip install . && rm -rf /build && apk del .build-deps gcc musl-dev libffi-dev g++ make build-base libzmq zeromq-dev
 
 EXPOSE 8089 5557
 
