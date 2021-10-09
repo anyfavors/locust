@@ -3,7 +3,8 @@ import gevent
 from tempfile import NamedTemporaryFile
 
 from locust.user import task, TaskSet
-from locust.contrib.fasthttp import FastHttpSession, FastHttpUser
+from locust.contrib.fasthttp import FastHttpSession
+from locust import FastHttpUser
 from locust.exception import CatchResponseError, InterruptTaskSet, ResponseError
 from locust.main import is_user_class
 from .testcases import WebserverTestCase, LocustTestCase
@@ -589,4 +590,5 @@ class TestFastHttpSsl(LocustTestCase):
         s = FastHttpSession(self.environment, "https://127.0.0.1:%i" % self.web_port, insecure=True, user=None)
         r = s.get("/")
         self.assertEqual(200, r.status_code)
-        self.assertIn("<title>Locust</title>", r.content.decode("utf-8"))
+        self.assertIn("<title>Locust for None</title>", r.content.decode("utf-8"))
+        self.assertIn("<p>Script: <span>None</span></p>", r.text)

@@ -25,7 +25,7 @@ from .exception import AuthCredentialsError
 from .shape import LoadTestShape
 from .input_events import input_listener
 from .html import get_html_report
-
+from json import dumps
 
 version = locust.__version__
 
@@ -99,11 +99,12 @@ def load_locustfile(path):
     return imported.__doc__, user_classes, shape_class
 
 
-def create_environment(user_classes, options, events=None, shape_class=None):
+def create_environment(user_classes, options, events=None, shape_class=None, locustfile=None):
     """
     Create an Environment instance from options
     """
     return Environment(
+        locustfile=locustfile,
         user_classes=user_classes,
         shape_class=shape_class,
         tags=options.tags,
@@ -132,6 +133,10 @@ def main():
 
     if options.slave or options.expect_slaves:
         sys.stderr.write("The --slave/--expect-slaves parameters have been renamed --worker/--expect-workers\n")
+        sys.exit(1)
+
+    if options.autoquit != -1 and not options.autostart:
+        sys.stderr.write("--autoquit is only meaningful in combination with --autostart\n")
         sys.exit(1)
 
     if options.step_time or options.step_load or options.step_users or options.step_clients:
@@ -200,7 +205,9 @@ def main():
             )
 
     # create locust Environment
-    environment = create_environment(user_classes, options, events=locust.events, shape_class=shape_class)
+    environment = create_environment(
+        user_classes, options, events=locust.events, shape_class=shape_class, locustfile=os.path.basename(locustfile)
+    )
 
     if shape_class and (options.num_users or options.spawn_rate):
         logger.warning(
@@ -216,7 +223,6 @@ def main():
         print_task_ratio(user_classes, total=True)
         sys.exit(0)
     if options.show_task_ratio_json:
-        from json import dumps
 
         task_data = {
             "per_class": get_task_ratio_dict(user_classes),
@@ -247,9 +253,6 @@ def main():
     main_greenlet = runner.greenlet
 
     if options.run_time:
-        if not options.headless:
-            logger.error("The --run-time argument can only be used together with --headless")
-            sys.exit(1)
         if options.worker:
             logger.error("--run-time should be specified on the master node, and not on worker nodes")
             sys.exit(1)
@@ -298,6 +301,12 @@ def main():
     else:
         web_ui = None
 
+    def assign_equal_weights(environment, **kwargs):
+        environment.assign_equal_weights()
+
+    if options.equal_weights:
+        environment.events.init.add_listener(assign_equal_weights)
+
     # Fire locust init event which can be used by end-users' code to run setup code that
     # need access to the Environment, Runner or WebUI.
     environment.events.init.fire(environment=environment, runner=runner, web_ui=web_ui)
@@ -306,9 +315,28 @@ def main():
         web_ui.start()
         main_greenlet = web_ui.greenlet
 
+    def stop_and_optionally_quit():
+        if options.autostart:
+            logger.info("--run-time limit reached, stopping test")
+            runner.stop()
+            if options.autoquit != -1:
+                logger.debug("Autoquit time limit set to %s seconds" % options.autoquit)
+                time.sleep(options.autoquit)
+                logger.info("--autoquit time reached, shutting down")
+                runner.quit()
+                web_ui.stop()
+            else:
+                logger.info("--autoquit not specified, leaving web ui running indefinitely")
+        else:  # --headless run
+            logger.info("--run-time limit reached. Stopping Locust")
+            runner.quit()
+
+    def spawn_run_time_quit_greenlet():
+        gevent.spawn_later(options.run_time, stop_and_optionally_quit).link_exception(greenlet_exception_handler)
+
     headless_master_greenlet = None
-    if options.headless:
-        # headless mode
+
+    def start_automatic_run():
         if options.master:
             # wait for worker nodes to connect
             while len(runner.clients.ready) < options.expect_workers:
@@ -330,25 +358,24 @@ def main():
 
             # start the test
             if environment.shape_class:
+                if options.run_time:
+                    sys.stderr.write("It makes no sense to combine --run-time and LoadShapes. Bailing out.\n")
+                    sys.exit(1)
                 environment.runner.start_shape()
+                environment.runner.shape_greenlet.join()
+                stop_and_optionally_quit()
             else:
                 headless_master_greenlet = gevent.spawn(runner.start, options.num_users, options.spawn_rate)
                 headless_master_greenlet.link_exception(greenlet_exception_handler)
 
-    def spawn_run_time_limit_greenlet():
-        def timelimit_stop():
-            logger.info("Time limit reached. Stopping Locust.")
-            runner.quit()
+        if options.run_time:
+            logger.info("Run time limit set to %s seconds" % options.run_time)
+            spawn_run_time_quit_greenlet()
+        elif not options.worker and not environment.shape_class:
+            logger.info("No run time limit set, use CTRL+C to interrupt")
 
-        gevent.spawn_later(options.run_time, timelimit_stop).link_exception(greenlet_exception_handler)
-
-    if options.run_time:
-        logger.info("Run time limit set to %s seconds" % options.run_time)
-        spawn_run_time_limit_greenlet()
-    elif options.headless and not options.worker and not environment.shape_class:
-        logger.info("No run time limit set, use CTRL+C to interrupt.")
-    else:
-        pass  # dont log anything - not having a time limit is normal when not running headless
+    if options.headless:
+        start_automatic_run()
 
     input_listener_greenlet = None
     if not options.worker:
@@ -430,11 +457,19 @@ def main():
 
     try:
         logger.info("Starting Locust %s" % version)
+        if options.autostart:
+            start_automatic_run()
+
         main_greenlet.join()
         if options.html_file:
             html_report = get_html_report(environment, show_download_link=False)
             with open(options.html_file, "w", encoding="utf-8") as file:
                 file.write(html_report)
-        shutdown()
     except KeyboardInterrupt:
-        shutdown()
+        pass
+    except Exception:
+        if input_listener_greenlet is not None:
+            input_listener_greenlet.kill(block=False)
+            time.sleep(0)
+        raise
+    shutdown()

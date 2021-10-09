@@ -21,6 +21,7 @@ from locust import (
     runners,
     __version__,
 )
+from locust.argument_parser import parse_options
 from locust.env import Environment
 from locust.exception import (
     RPCError,
@@ -46,6 +47,7 @@ from locust.user import (
     User,
     task,
 )
+from retry import retry
 
 NETWORK_BROKEN = "network broken"
 
@@ -150,7 +152,8 @@ class TestLocustRunner(LocustTestCase):
                     triggered[0] = True
 
         runner = Environment(user_classes=[BaseUser]).create_local_runner()
-        runner.spawn_users({BaseUser.__name__: 2}, wait=False)
+        users = runner.spawn_users({BaseUser.__name__: 2}, wait=False)
+        self.assertEqual(2, len(users))
         self.assertEqual(2, len(runner.user_greenlets))
         g1 = list(runner.user_greenlets)[0]
         g2 = list(runner.user_greenlets)[1]
@@ -338,7 +341,8 @@ class TestLocustRunner(LocustTestCase):
                 BaseUser.stop_triggered = True
 
         runner = Environment(user_classes=[BaseUser]).create_local_runner()
-        runner.spawn_users({BaseUser.__name__: 1}, wait=False)
+        users = runner.spawn_users({BaseUser.__name__: 1}, wait=False)
+        self.assertEqual(1, len(users))
         timeout = gevent.Timeout(0.5)
         timeout.start()
         try:
@@ -363,7 +367,8 @@ class TestLocustRunner(LocustTestCase):
                 BaseUser.stop_count += 1
 
         runner = Environment(user_classes=[BaseUser]).create_local_runner()
-        runner.spawn_users({BaseUser.__name__: 10}, wait=False)
+        users = runner.spawn_users({BaseUser.__name__: 10}, wait=False)
+        self.assertEqual(10, len(users))
         timeout = gevent.Timeout(0.3)
         timeout.start()
         try:
@@ -603,6 +608,46 @@ class TestLocustRunner(LocustTestCase):
         local_runner.stop()
         web_ui.stop()
 
+    def test_target_user_count_is_set_before_ramp_up(self):
+        """Test for https://github.com/locustio/locust/issues/1883"""
+
+        class MyUser1(User):
+            wait_time = constant(0)
+
+            @task
+            def my_task(self):
+                pass
+
+        environment = Environment(user_classes=[MyUser1])
+        runner = LocalRunner(environment)
+
+        test_start_event_fired = [False]
+
+        @environment.events.test_start.add_listener
+        def on_test_start(*args, **kwargs):
+            test_start_event_fired[0] = True
+            self.assertEqual(runner.target_user_count, 3)
+
+        runner.start(user_count=3, spawn_rate=1, wait=False)
+
+        gevent.sleep(1)
+
+        self.assertEqual(runner.target_user_count, 3)
+        self.assertEqual(runner.user_count, 1)
+        # However, target_user_classes_count is only updated at the end of the ramp-up/ramp-down
+        # due to the way it is implemented.
+        self.assertDictEqual({}, runner.target_user_classes_count)
+
+        runner.spawning_greenlet.join()
+
+        self.assertEqual(runner.target_user_count, 3)
+        self.assertEqual(runner.user_count, 3)
+        self.assertDictEqual({"MyUser1": 3}, runner.target_user_classes_count)
+
+        runner.quit()
+
+        self.assertTrue(test_start_event_fired[0])
+
 
 class TestMasterWorkerRunners(LocustTestCase):
     def test_distributed_integration_run(self):
@@ -615,8 +660,8 @@ class TestMasterWorkerRunners(LocustTestCase):
             wait_time = constant(0.1)
 
             @task
-            def incr_stats(l):
-                l.environment.events.request.fire(
+            def incr_stats(self):
+                self.environment.events.request.fire(
                     request_type="GET",
                     name="/",
                     response_time=1337,
@@ -658,6 +703,170 @@ class TestMasterWorkerRunners(LocustTestCase):
             20,
             "For some reason the master node's stats has not come in",
         )
+
+    def test_distributed_rebalanced_integration_run(self):
+        """
+        Full integration test that starts both a MasterRunner and three WorkerRunner instances
+        and makes sure that their stats is sent to the Master.
+        """
+
+        class TestUser(User):
+            wait_time = constant(0.1)
+
+            @task
+            def incr_stats(self):
+                self.environment.events.request.fire(
+                    request_type="GET",
+                    name="/",
+                    response_time=1337,
+                    response_length=666,
+                    exception=None,
+                    context={},
+                )
+
+        with mock.patch("locust.runners.WORKER_REPORT_INTERVAL", new=0.3):
+            # start a Master runner
+            options = parse_options(["--enable-rebalancing"])
+            master_env = Environment(user_classes=[TestUser], parsed_options=options)
+            master = master_env.create_master_runner("*", 0)
+            sleep(0)
+            # start 3 Worker runners
+            workers = []
+
+            def add_worker():
+                worker_env = Environment(user_classes=[TestUser])
+                worker = worker_env.create_worker_runner("127.0.0.1", master.server.port)
+                workers.append(worker)
+
+            for i in range(3):
+                add_worker()
+
+            # give workers time to connect
+            sleep(0.1)
+            # issue start command that should trigger TestUsers to be spawned in the Workers
+            master.start(6, spawn_rate=1000)
+            sleep(0.1)
+            # check that worker nodes have started locusts
+            for worker in workers:
+                self.assertEqual(2, worker.user_count)
+            # give time for users to generate stats, and stats to be sent to master
+            # Add 1 more workers (should be 4 now)
+            add_worker()
+
+            @retry(AssertionError, tries=10, delay=0.5)
+            def check_rebalanced_true():
+                for worker in workers:
+                    self.assertTrue(worker.user_count > 0)
+
+            # Check that all workers have a user count > 0 at least
+            check_rebalanced_true()
+            # Add 2 more workers (should be 6 now)
+            add_worker()
+            add_worker()
+
+            @retry(AssertionError, tries=10, delay=0.5)
+            def check_rebalanced_equals():
+                for worker in workers:
+                    self.assertEqual(1, worker.user_count)
+
+            # Check that all workers have a user count = 1 now
+            check_rebalanced_equals()
+
+            # Simulate that some workers are missing by "killing" them abrutly
+            for i in range(3):
+                workers[i].greenlet.kill(block=True)
+
+            @retry(AssertionError, tries=10, delay=1)
+            def check_master_worker_missing_count():
+                self.assertEqual(3, len(master.clients.missing))
+
+            # Check that master detected the missing workers
+            check_master_worker_missing_count()
+
+            @retry(AssertionError, tries=10, delay=1)
+            def check_remaing_worker_new_user_count():
+                for i in range(3, 6):
+                    self.assertEqual(2, workers[i].user_count)
+
+            # Check that remaining workers have a new count of user due to rebalancing.
+            check_remaing_worker_new_user_count()
+            sleep(1)
+
+            # Finally quit and check states of remaining workers.
+            master.quit()
+            # make sure users are killed on remaining workers
+            for i in range(3, 6):
+                self.assertEqual(0, workers[i].user_count)
+
+        # check that stats are present in master
+        self.assertGreater(
+            master_env.runner.stats.total.num_requests,
+            20,
+            "For some reason the master node's stats has not come in",
+        )
+
+    def test_distributed_run_with_custom_args(self):
+        """
+        Full integration test that starts both a MasterRunner and three WorkerRunner instances
+        and makes sure that their stats is sent to the Master.
+        """
+
+        class TestUser(User):
+            wait_time = constant(0.1)
+
+            @task
+            def incr_stats(self):
+                self.environment.events.request.fire(
+                    request_type="GET",
+                    name=self.environment.parsed_options.my_str_argument,
+                    response_time=self.environment.parsed_options.my_int_argument,
+                    response_length=666,
+                    exception=None,
+                    context={},
+                )
+
+        @locust.events.init_command_line_parser.add_listener
+        def _(parser, **kw):
+            parser.add_argument("--my-int-argument", type=int)
+            parser.add_argument("--my-str-argument", type=str, default="NOOOO")
+
+        with mock.patch("locust.runners.WORKER_REPORT_INTERVAL", new=0.3):
+            # start a Master runner
+            master_env = Environment(user_classes=[TestUser])
+            master = master_env.create_master_runner("*", 0)
+            master_env.parsed_options = parse_options(
+                [
+                    "--my-int-argument",
+                    "42",
+                    "--my-str-argument",
+                    "cool-string",
+                ]
+            )
+            sleep(0)
+            # start 3 Worker runners
+            workers = []
+            for i in range(3):
+                worker_env = Environment(user_classes=[TestUser])
+                worker = worker_env.create_worker_runner("127.0.0.1", master.server.port)
+                workers.append(worker)
+
+            # give workers time to connect
+            sleep(0.1)
+            # issue start command that should trigger TestUsers to be spawned in the Workers
+            master.start(6, spawn_rate=1000)
+            sleep(0.1)
+            # check that worker nodes have started locusts
+            for worker in workers:
+                self.assertEqual(2, worker.user_count)
+            # give time for users to generate stats, and stats to be sent to master
+            sleep(1)
+            master.quit()
+            # make sure users are killed
+            for worker in workers:
+                self.assertEqual(0, worker.user_count)
+
+        self.assertEqual(master_env.runner.stats.total.max_response_time, 42)
+        self.assertEqual(master_env.runner.stats.get("cool-string", "GET").avg_response_time, 42)
 
     def test_test_stop_event(self):
         class TestUser(User):
@@ -1378,6 +1587,60 @@ class TestMasterWorkerRunners(LocustTestCase):
 
             master.stop()
             web_ui.stop()
+
+    def test_target_user_count_is_set_before_ramp_up(self):
+        """Test for https://github.com/locustio/locust/issues/1883"""
+
+        class MyUser1(User):
+            wait_time = constant(0)
+
+            @task
+            def my_task(self):
+                pass
+
+        with mock.patch("locust.runners.WORKER_REPORT_INTERVAL", new=0.3):
+            # start a Master runner
+            master_env = Environment(user_classes=[MyUser1])
+            master = master_env.create_master_runner("*", 0)
+
+            test_start_event_fired = [False]
+
+            @master_env.events.test_start.add_listener
+            def on_test_start(*args, **kwargs):
+                test_start_event_fired[0] = True
+                self.assertEqual(master.target_user_count, 3)
+
+            sleep(0)
+
+            # start 1 worker runner
+            worker_env = Environment(user_classes=[MyUser1])
+            worker = worker_env.create_worker_runner("127.0.0.1", master.server.port)
+
+            # give worker time to connect
+            sleep(0.1)
+
+            gevent.spawn(master.start, 3, spawn_rate=1)
+
+            sleep(1)
+
+            self.assertEqual(master.target_user_count, 3)
+            self.assertEqual(master.user_count, 1)
+            # However, target_user_classes_count is only updated at the end of the ramp-up/ramp-down
+            # due to the way it is implemented.
+            self.assertDictEqual({}, master.target_user_classes_count)
+
+            sleep(2)
+
+            self.assertEqual(master.target_user_count, 3)
+            self.assertEqual(master.user_count, 3)
+            self.assertDictEqual({"MyUser1": 3}, master.target_user_classes_count)
+
+            master.quit()
+
+            # make sure users are killed
+            self.assertEqual(0, worker.user_count)
+
+            self.assertTrue(test_start_event_fired[0])
 
 
 class TestMasterRunner(LocustTestCase):
@@ -2267,6 +2530,7 @@ class TestWorkerRunner(LocustTestCase):
                         "user_classes_count": {"MyTestUser": 1},
                         "host": "",
                         "stop_timeout": 1,
+                        "parsed_options": {},
                     },
                     "dummy_client_id",
                 )
@@ -2307,6 +2571,7 @@ class TestWorkerRunner(LocustTestCase):
                         "user_classes_count": {"MyTestUser": 1},
                         "host": "",
                         "stop_timeout": None,
+                        "parsed_options": {},
                     },
                     "dummy_client_id",
                 )
@@ -2351,6 +2616,7 @@ class TestWorkerRunner(LocustTestCase):
                         "user_classes_count": {"MyUser": 10},
                         "host": "",
                         "stop_timeout": None,
+                        "parsed_options": {},
                     },
                     "dummy_client_id",
                 )
@@ -2369,6 +2635,7 @@ class TestWorkerRunner(LocustTestCase):
                         "user_classes_count": {"MyUser": 9},
                         "host": "",
                         "stop_timeout": None,
+                        "parsed_options": {},
                     },
                     "dummy_client_id",
                 )
@@ -2386,6 +2653,7 @@ class TestWorkerRunner(LocustTestCase):
                         "user_classes_count": {"MyUser": 2},
                         "host": "",
                         "stop_timeout": None,
+                        "parsed_options": {},
                     },
                     "dummy_client_id",
                 )
@@ -2403,6 +2671,7 @@ class TestWorkerRunner(LocustTestCase):
                         "user_classes_count": {"MyUser": 2},
                         "host": "",
                         "stop_timeout": None,
+                        "parsed_options": {},
                     },
                     "dummy_client_id",
                 )
@@ -2443,6 +2712,7 @@ class TestWorkerRunner(LocustTestCase):
                         "user_classes_count": {"MyUser": 10},
                         "host": "",
                         "stop_timeout": None,
+                        "parsed_options": {},
                     },
                     "dummy_client_id",
                 )
@@ -2524,6 +2794,7 @@ class TestWorkerRunner(LocustTestCase):
                         "user_classes_count": {"MyUser": 10},
                         "host": "",
                         "stop_timeout": None,
+                        "parsed_options": {},
                     },
                     "dummy_client_id",
                 )
@@ -2538,6 +2809,7 @@ class TestWorkerRunner(LocustTestCase):
                         "user_classes_count": {"MyUser": 9},
                         "host": "",
                         "stop_timeout": None,
+                        "parsed_options": {},
                     },
                     "dummy_client_id",
                 )
@@ -2574,6 +2846,7 @@ class TestWorkerRunner(LocustTestCase):
                         "user_classes_count": {"MyUser1": 10, "MyUser2": 10},
                         "host": "",
                         "stop_timeout": None,
+                        "parsed_options": {},
                     },
                     "dummy_client_id",
                 )
@@ -2591,6 +2864,7 @@ class TestWorkerRunner(LocustTestCase):
                         "user_classes_count": {"MyUser1": 1, "MyUser2": 2},
                         "host": "",
                         "stop_timeout": None,
+                        "parsed_options": {},
                     },
                     "dummy_client_id",
                 )
@@ -2702,6 +2976,7 @@ class TestWorkerRunner(LocustTestCase):
                         "num_users": 1,
                         "host": "",
                         "stop_timeout": None,
+                        "parsed_options": {},
                     },
                     "dummy_client_id",
                 )
@@ -2727,6 +3002,7 @@ class TestWorkerRunner(LocustTestCase):
                         "num_users": 1,
                         "host": "",
                         "stop_timeout": None,
+                        "parsed_options": {},
                     },
                     "dummy_client_id",
                 )
@@ -2745,6 +3021,7 @@ class TestWorkerRunner(LocustTestCase):
                         "num_users": 1,
                         "host": "",
                         "stop_timeout": None,
+                        "parsed_options": {},
                     },
                     "dummy_client_id",
                 )
@@ -2785,6 +3062,7 @@ class TestWorkerRunner(LocustTestCase):
                         "num_users": 1,
                         "host": "",
                         "stop_timeout": None,
+                        "parsed_options": {},
                     },
                     "dummy_client_id",
                 )
@@ -2820,6 +3098,7 @@ class TestWorkerRunner(LocustTestCase):
                         "num_users": 1,
                         "host": "",
                         "stop_timeout": None,
+                        "parsed_options": {},
                     },
                     "dummy_client_id",
                 )

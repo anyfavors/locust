@@ -2,6 +2,7 @@ import argparse
 import os
 import sys
 import textwrap
+from typing import Dict
 
 import configargparse
 
@@ -11,6 +12,32 @@ version = locust.__version__
 
 
 DEFAULT_CONFIG_FILES = ["~/.locust.conf", "locust.conf"]
+
+
+class LocustArgumentParser(configargparse.ArgumentParser):
+    """Drop-in replacement for `configargparse.ArgumentParser` that adds support for
+    optionally exclude arguments from the UI.
+    """
+
+    def add_argument(self, *args, **kwargs) -> configargparse.Action:
+        """
+        This method supports the same args as ArgumentParser.add_argument(..)
+        as well as the additional args below.
+
+        Arguments:
+            include_in_web_ui: If True (default), the argument will show in the UI.
+
+        Returns:
+            argparse.Action: the new argparse action
+        """
+        include_in_web_ui = kwargs.pop("include_in_web_ui", True)
+        action = super().add_argument(*args, **kwargs)
+        action.include_in_web_ui = include_in_web_ui
+        return action
+
+    @property
+    def args_included_in_web_ui(self) -> Dict[str, configargparse.Action]:
+        return {a.dest: a for a in self._actions if hasattr(a, "include_in_web_ui") and a.include_in_web_ui}
 
 
 def _is_package(path):
@@ -54,8 +81,8 @@ def find_locustfile(locustfile):
     # Implicit 'return None' if nothing was found
 
 
-def get_empty_argument_parser(add_help=True, default_config_files=DEFAULT_CONFIG_FILES):
-    parser = configargparse.ArgumentParser(
+def get_empty_argument_parser(add_help=True, default_config_files=DEFAULT_CONFIG_FILES) -> LocustArgumentParser:
+    parser = LocustArgumentParser(
         default_config_files=default_config_files,
         add_env_var_help=False,
         add_config_file_help=False,
@@ -141,14 +168,14 @@ def setup_parser_arguments(parser):
         "--users",
         type=int,
         dest="num_users",
-        help="Number of concurrent Locust users. Primarily used together with --headless. Can be changed during a test by inputs w, W(spawn 1, 10 users) and s, S(stop 1, 10 users)",
+        help="Peak number of concurrent Locust users. Primarily used together with --headless or --autostart. Can be changed during a test by keyboard inputs w, W (spawn 1, 10 users) and s, S (stop 1, 10 users)",
         env_var="LOCUST_USERS",
     )
     parser.add_argument(
         "-r",
         "--spawn-rate",
         type=float,
-        help="The rate per second in which users are spawned. Primarily used together with --headless",
+        help="Rate to spawn users at (users per second). Primarily used together with --headless or --autostart",
         env_var="LOCUST_SPAWN_RATE",
     )
     parser.add_argument(
@@ -161,7 +188,7 @@ def setup_parser_arguments(parser):
     parser.add_argument(
         "-t",
         "--run-time",
-        help="Stop after the specified amount of time, e.g. (300s, 20m, 3h, 1h30m, etc.). Only used together with --headless. Defaults to run forever.",
+        help="Stop after the specified amount of time, e.g. (300s, 20m, 3h, 1h30m, etc.). Only used together with --headless or --autostart. Defaults to run forever.",
         env_var="LOCUST_RUN_TIME",
     )
     parser.add_argument(
@@ -190,8 +217,21 @@ def setup_parser_arguments(parser):
     web_ui_group.add_argument(
         "--headless",
         action="store_true",
-        help="Disable the web interface, and instead start the load test immediately. Requires -u and -t to be specified.",
+        help="Disable the web interface, and start the test immediately. Use -u and -t to control user count and run time",
         env_var="LOCUST_HEADLESS",
+    )
+    web_ui_group.add_argument(
+        "--autostart",
+        action="store_true",
+        help="Starts the test immediately (without disabling the web UI). Use -u and -t to control user count and run time",
+        env_var="LOCUST_AUTOSTART",
+    )
+    web_ui_group.add_argument(
+        "--autoquit",
+        type=int,
+        default=-1,
+        help="Quits Locust entirely, X seconds after the run is finished. Only used together with --autostart. The default is to keep Locust running until you shut it down using CTRL+C",
+        env_var="LOCUST_AUTOQUIT",
     )
     # Override --headless parameter (useful because you cant disable a store_true-parameter like headless once it has been set in a config file)
     web_ui_group.add_argument(
@@ -417,6 +457,20 @@ def setup_parser_arguments(parser):
         help="Number of seconds to wait for a simulated user to complete any executing task before exiting. Default is to terminate immediately. This parameter only needs to be specified for the master process when running Locust distributed.",
         env_var="LOCUST_STOP_TIMEOUT",
     )
+    other_group.add_argument(
+        "--equal-weights",
+        action="store_true",
+        default=False,
+        dest="equal_weights",
+        help="Use equally distributed task weights, overriding the weights specified in the locustfile.",
+    )
+    other_group.add_argument(
+        "--enable-rebalancing",
+        action="store_true",
+        default=False,
+        dest="enable_rebalancing",
+        help="Allow to automatically rebalance users if new workers are added or removed during a test run.",
+    )
 
     user_classes_group = parser.add_argument_group("User classes")
     user_classes_group.add_argument(
@@ -443,3 +497,23 @@ def parse_options(args=None):
     if parsed_opts.stats_history_enabled and (parsed_opts.csv_prefix is None):
         parser.error("'--csv-full-history' requires '--csv'.")
     return parsed_opts
+
+
+def default_args_dict():
+    # returns a dict containing the default arguments (before any custom arguments are added)
+    default_parser = get_empty_argument_parser()
+    setup_parser_arguments(default_parser)
+    # Dont read config files because they may contain custom arguments, which would fail parsing in the next step
+    default_parser._default_config_files = {}
+    return vars(default_parser.parse([]))
+
+
+def ui_extra_args_dict(args=None) -> Dict[str, str]:
+    """Get all the UI visible arguments"""
+    locust_args = default_args_dict()
+
+    parser = get_parser()
+    all_args = vars(parser.parse_args(args))
+
+    extra_args = {k: v for k, v in all_args.items() if k not in locust_args and k in parser.args_included_in_web_ui}
+    return extra_args

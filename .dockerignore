@@ -4,5 +4,4 @@ dist/
 build/
 .coverage
 .tox/
-docs/
-.git/
+docs/_build

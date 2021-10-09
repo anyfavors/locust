@@ -41,6 +41,7 @@ from .stats import (
     RequestStats,
     setup_distributed_stats_event_listeners,
 )
+from . import argument_parser
 
 logger = logging.getLogger(__name__)
 
@@ -88,7 +89,12 @@ class Runner:
         self.worker_cpu_warning_emitted = False
         self.greenlet.spawn(self.monitor_cpu).link_exception(greenlet_exception_handler)
         self.exceptions = {}
+        # Because of the way the ramp-up/ramp-down is implemented, target_user_classes_count
+        # is only updated at the end of the ramp-up/ramp-down.
+        # See https://github.com/locustio/locust/issues/1883#issuecomment-919239824 for context.
         self.target_user_classes_count: Dict[str, int] = {}
+        # target_user_count is set before the ramp-up/ramp-down occurs.
+        self.target_user_count: int = 0
         self.custom_messages = {}
 
         # Only when running in standalone mode (non-distributed)
@@ -204,20 +210,25 @@ class Runner:
 
         def spawn(user_class: str, spawn_count: int):
             n = 0
+            new_users = []
             while n < spawn_count:
                 new_user = self.user_classes_by_name[user_class](self.environment)
                 new_user.start(self.user_greenlets)
+                new_users.append(new_user)
                 n += 1
                 if n % 10 == 0 or n == spawn_count:
                     logger.debug("%i users spawned" % self.user_count)
             logger.debug("All users of class %s spawned" % user_class)
+            return new_users
 
+        new_users = []
         for user_class, spawn_count in user_classes_spawn_count.items():
-            spawn(user_class, spawn_count)
+            new_users += spawn(user_class, spawn_count)
 
         if wait:
             self.user_greenlets.join()
             logger.info("All users stopped\n")
+        return new_users
 
     def stop_users(self, user_classes_stop_count: Dict[str, int]):
         async_calls_to_stop = Group()
@@ -292,6 +303,8 @@ class Runner:
                      If False (the default), a greenlet that spawns the users will be
                      started and the call to this method will return immediately.
         """
+        self.target_user_count = user_count
+
         if self.state != STATE_RUNNING and self.state != STATE_SPAWNING:
             self.stats.clear_all()
             self.exceptions = {}
@@ -350,9 +363,14 @@ class Runner:
 
         logger.info("All users spawned: %s" % _format_user_classes_count_for_log(self.user_classes_count))
 
+        self.target_user_classes_count = self.user_classes_count
+
         self.environment.events.spawning_complete.fire(user_count=sum(self.target_user_classes_count.values()))
 
     def start_shape(self):
+        """
+        Start running a load test with a custom LoadTestShape specified in the :meth:`Environment.shape_class <locust.env.Environment.shape_class>` parameter.
+        """
         if self.shape_greenlet:
             logger.info("There is an ongoing shape test running. Editing is disabled")
             return
@@ -438,10 +456,6 @@ class Runner:
         row["count"] += 1
         row["nodes"].add(node_id)
         self.exceptions[key] = row
-
-    @property
-    def target_user_count(self) -> int:
-        return sum(self.target_user_classes_count.values())
 
     def register_message(self, msg_type, listener):
         """
@@ -592,6 +606,7 @@ class MasterRunner(DistributedRunner):
         self.master_bind_host = master_bind_host
         self.master_bind_port = master_bind_port
         self.spawn_rate: float = 0
+        self.spawning_completed = False
 
         self.clients = WorkerNodes()
         try:
@@ -628,6 +643,9 @@ class MasterRunner(DistributedRunner):
 
         self.environment.events.quitting.add_listener(on_quitting)
 
+    def rebalancing_enabled(self) -> bool:
+        return self.environment.parsed_options and self.environment.parsed_options.enable_rebalancing
+
     @property
     def user_count(self) -> int:
         return sum(c.user_count for c in self.clients.values())
@@ -640,6 +658,10 @@ class MasterRunner(DistributedRunner):
         return warning_emitted
 
     def start(self, user_count: int, spawn_rate: float, **kwargs) -> None:
+        self.spawning_completed = False
+
+        self.target_user_count = user_count
+
         num_workers = len(self.clients.ready) + len(self.clients.running) + len(self.clients.spawning)
         if not num_workers:
             logger.warning(
@@ -690,6 +712,9 @@ class MasterRunner(DistributedRunner):
                         "user_classes_count": worker_user_classes_count,
                         "host": self.environment.host,
                         "stop_timeout": self.environment.stop_timeout,
+                        "parsed_options": vars(self.environment.parsed_options)
+                        if self.environment.parsed_options
+                        else {},
                     }
                     dispatch_greenlets.add(
                         gevent.spawn_later(
@@ -732,6 +757,7 @@ class MasterRunner(DistributedRunner):
             timeout.cancel()
 
         self.environment.events.spawning_complete.fire(user_count=sum(self.target_user_classes_count.values()))
+        self.spawning_completed = True
 
         logger.info("All users spawned: %s" % _format_user_classes_count_for_log(self.reported_user_classes_count))
 
@@ -819,7 +845,8 @@ class MasterRunner(DistributedRunner):
                     client.user_classes_count = {}
                     if self._users_dispatcher is not None:
                         self._users_dispatcher.remove_worker(client)
-                        # TODO: If status is `STATE_RUNNING`, call self.start()
+                        if self.rebalancing_enabled() and self.state == STATE_RUNNING and self.spawning_completed:
+                            self.start(self.target_user_count, self.spawn_rate)
                     if self.worker_count <= 0:
                         logger.info("The last worker went missing, stopping test.")
                         self.stop()
@@ -865,10 +892,8 @@ class MasterRunner(DistributedRunner):
                     "Client %r reported as ready. Currently %i clients ready to swarm."
                     % (worker_node_id, len(self.clients.ready + self.clients.running + self.clients.spawning))
                 )
-                # if self.state == STATE_RUNNING or self.state == STATE_SPAWNING:
-                #     # TODO: Necessary now that UsersDispatcher handles that?
-                #     # balance the load distribution when new client joins
-                #     self.start(self.target_user_count, self.spawn_rate)
+                if self.rebalancing_enabled() and self.state == STATE_RUNNING and self.spawning_completed:
+                    self.start(self.target_user_count, self.spawn_rate)
                 # emit a warning if the worker's clock seem to be out of sync with our clock
                 # if abs(time() - msg.data["time"]) > 5.0:
                 #    warnings.warn("The worker node's clock seem to be out of sync. For the statistics to be correct the different locust servers need to have synchronized clocks.")
@@ -1039,6 +1064,7 @@ class WorkerRunner(DistributedRunner):
         :param user_classes_count: Users to run
         """
         self.target_user_classes_count = user_classes_count
+        self.target_user_count = sum(user_classes_count.values())
         if self.worker_state != STATE_RUNNING and self.worker_state != STATE_SPAWNING:
             self.stats.clear_all()
             self.exceptions = {}
@@ -1112,6 +1138,17 @@ class WorkerRunner(DistributedRunner):
                     continue
                 self.environment.host = job["host"]
                 self.environment.stop_timeout = job["stop_timeout"]
+
+                # receive custom arguments
+                if self.environment.parsed_options is None:
+                    default_parser = argument_parser.get_empty_argument_parser()
+                    argument_parser.setup_parser_arguments(default_parser)
+                    self.environment.parsed_options = default_parser.parse(args=[])
+                custom_args_from_master = {
+                    k: v for k, v in job["parsed_options"].items() if k not in argument_parser.default_args_dict()
+                }
+                vars(self.environment.parsed_options).update(custom_args_from_master)
+
                 if self.spawning_greenlet:
                     # kill existing spawning greenlet before we launch new one
                     self.spawning_greenlet.kill(block=True)

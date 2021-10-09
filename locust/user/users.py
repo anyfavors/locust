@@ -1,5 +1,6 @@
 from locust.user.wait_time import constant
 from typing import Any, Callable, Dict, List, TypeVar, Union
+from typing_extensions import final
 from gevent import GreenletExit, greenlet
 from gevent.pool import Group
 from locust.clients import HttpSession
@@ -100,7 +101,7 @@ class User(object, metaclass=UserMeta):
     """If abstract is True, the class is meant to be subclassed, and locust will not spawn users of this class during a test."""
 
     environment = None
-    """A reference to the :py:attr:`environment <locust.Environment>` in which this locust is running"""
+    """A reference to the :py:class:`Environment <locust.env.Environment>` in which this user is running"""
 
     client = None
     _state = None
@@ -124,6 +125,7 @@ class User(object, metaclass=UserMeta):
         """
         pass
 
+    @final
     def run(self):
         self._state = LOCUST_STATE_RUNNING
         self._taskset_instance = DefaultTaskSet(self)
