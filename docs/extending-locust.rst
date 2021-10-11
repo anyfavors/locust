@@ -12,7 +12,7 @@ For example, here's how to set up an event listener that will trigger after a re
     
     @events.request.add_listener
     def my_request_handler(request_type, name, response_time, response_length, response,
-                           context, exception, **kwargs):
+                           context, exception, start_time, url, **kwargs):
         if exception:
             print(f"Request to {name} failed with exception {exception}")
         else:
@@ -36,14 +36,14 @@ You can check to ensure you aren't running on the master node by checking the ty
     def on_test_start(environment, **kwargs):
         if not isinstance(environment.runner, MasterRunner):
             print("Beginning test setup")
-        else
+        else:
             print("Started test from Master node")
 
     @events.test_stop.add_listener
     def on_test_stop(environment, **kwargs):
         if not isinstance(environment.runner, MasterRunner):
             print("Cleaning up test data")
-        else
+        else:
             print("Stopped test from Master node")
 
 You can also use events `to add custom command line arguments <https://github.com/locustio/locust/tree/master/examples/add_command_line_argument.py>`_. 
