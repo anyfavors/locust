@@ -14,6 +14,7 @@ jobs:
           #- {name: Linux, python: '3.9', os: ubuntu-latest, tox: py39}
           #- {name: Windows, python: '3.9', os: windows-latest, tox: py39}
           #- {name: Mac, python: '3.9', os: macos-latest, tox: py39}
+          - { name: "3.10", python: "3.10", os: ubuntu-latest, tox: py310 }
           - { name: "3.9", python: "3.9", os: ubuntu-latest, tox: py39 }
           - { name: "3.8", python: "3.8", os: ubuntu-latest, tox: py38 }
           - { name: "3.7", python: "3.7", os: ubuntu-latest, tox: py37 }
@@ -55,11 +56,19 @@ jobs:
         with:
           username: locustbuild
           password: ${{ secrets.DOCKER_HUB_ACCESS_TOKEN }}
-      - uses: docker/build-push-action@v2
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v1
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v1
+      - name: build and publish image
+        id: docker_build
+        uses: docker/build-push-action@v2
         with:
           build-args: |
             BUILDKIT_CONTEXT_KEEP_GIT_DIR=1
           context: .
+          file: ./Dockerfile
+          platforms: linux/amd64,linux/arm64
           push: ${{ github.ref == 'refs/heads/master' && github.repository_owner == 'locustio' }}
           tags: locustio/locust:master
 
@@ -78,11 +87,19 @@ jobs:
         with:
           username: locustbuild
           password: ${{ secrets.DOCKER_HUB_ACCESS_TOKEN }}
-      - uses: docker/build-push-action@v2
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v1
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v1
+      - name: build and publish image
+        id: docker_build   
+        uses: docker/build-push-action@v2    
         with:
           build-args: |
             BUILDKIT_CONTEXT_KEEP_GIT_DIR=1
           context: .
+          file: ./Dockerfile
+          platforms: linux/amd64,linux/arm64
           push: true
           tags: locustio/locust:${{ env.TAG }}${{ ( env.BRANCH == 'master' && ',locustio/locust:latest') || '' }}
 
