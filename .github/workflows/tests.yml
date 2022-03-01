@@ -21,7 +21,7 @@ jobs:
           - { name: "3.6", python: "3.6", os: ubuntu-latest, tox: py36 }
 
     steps:
-      - uses: actions/checkout@v2
+      - uses: actions/checkout@v3
       - uses: actions/setup-python@v2
         with:
           python-version: ${{ matrix.python }}
@@ -48,7 +48,7 @@ jobs:
     runs-on: ubuntu-latest
     if: github.event_name != 'pull_request' # PR build doesnt get proper version, so dont try to build it
     steps:
-      - uses: actions/checkout@v2
+      - uses: actions/checkout@v3
         with:
           fetch-depth: 0
       - uses: docker/login-action@v1
@@ -78,7 +78,7 @@ jobs:
     runs-on: ubuntu-latest
     if: startsWith(github.event.ref, 'refs/tags') && github.repository_owner == 'locustio'
     steps:
-      - uses: actions/checkout@v2
+      - uses: actions/checkout@v3
         with:
           fetch-depth: 0
       - run: echo "TAG=${GITHUB_REF#refs/*/}" | tee -a $GITHUB_ENV
@@ -109,7 +109,7 @@ jobs:
     if: startsWith(github.event.ref, 'refs/tags') && github.repository_owner == 'locustio'
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v2
+      - uses: actions/checkout@v3
         with:
           fetch-depth: 0
       - name: Set up Python
@@ -136,7 +136,7 @@ jobs:
     if: github.ref == 'refs/heads/master' && github.repository_owner == 'locustio'
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v2
+      - uses: actions/checkout@v3
         with:
           fetch-depth: 0
       - name: Set up Python
